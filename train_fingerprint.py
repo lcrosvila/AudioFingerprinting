@@ -19,12 +19,12 @@ import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.callbacks import ModelCheckpoint
 
-# Import loading logic from convolution_reverb
+# Import h5py directly here for preloading
 try:
-    from convolution_reverb import load_ir_from_h5
+    import h5py
 except ImportError:
-    print("Warning: convolution_reverb.py not found. H5 loading will fail.")
-    load_ir_from_h5 = None
+    h5py = None
+    print("Warning: h5py not installed. H5 files will be skipped.")
 
 # Configuration
 CONFIG = {
@@ -48,15 +48,53 @@ CONFIG = {
     'ir_root': 'data/IR'
 }
 
+def preload_h5_data(h5_files):
+    """
+    Loads all H5 IRs into a Python dictionary in RAM.
+    Returns: dict { 'filename': numpy_array_of_shape(sources, mics, samples) }
+    """
+    if not h5_files or h5py is None:
+        return {}
+
+    print(f"--- Preloading {len(h5_files)} H5 files into RAM (This may take a minute) ---")
+    cache = {}
+    total_mb = 0
+    
+    for path in h5_files:
+        try:
+            fname = os.path.basename(path)
+            with h5py.File(path, 'r') as f:
+                # Based on MIRACLE structure: data -> impulse_response
+                # We load the WHOLE tensor into RAM. 
+                # Shape is usually (Source, Mic, Time)
+                if 'data' in f and 'impulse_response' in f['data']:
+                    data = f['data']['impulse_response'][:]
+                    cache[fname] = data.astype(np.float32)
+                    
+                    size_mb = data.nbytes / (1024 * 1024)
+                    total_mb += size_mb
+                    print(f"Loaded {fname}: {data.shape} ({size_mb:.1f} MB)")
+                elif 'impulse_response' in f:
+                     # Some files might be flatter
+                    data = f['impulse_response'][:]
+                    cache[fname] = data.astype(np.float32)
+                    print(f"Loaded {fname} (flat): {data.shape}")
+        except Exception as e:
+            print(f"Failed to load H5 {path}: {e}")
+
+    print(f"--- H5 Preload Complete. Total Size: {total_mb:.1f} MB ---")
+    return cache
+
 class RobustFingerprintDataset(Dataset):
-    """
-    Same robust dataset logic as before, optimized for random access.
-    """
-    def __init__(self, source_files, noise_files, ir_files, ir_pickle_data=None):
+    def __init__(self, source_files, noise_files, ir_wav_files, ir_pickle_data=None, ir_h5_cache=None):
         self.source_files = source_files
         self.noise_files = noise_files
-        self.ir_files = ir_files
+        
+        # We separate file paths by type
+        self.ir_wav_files = ir_wav_files
         self.ir_pickle_data = ir_pickle_data 
+        self.ir_h5_cache = ir_h5_cache # Dict: {filename: data_array}
+        self.h5_keys = list(ir_h5_cache.keys()) if ir_h5_cache else []
         
         self.sample_rate = CONFIG['sample_rate']
         self.num_samples = int(CONFIG['duration'] * self.sample_rate)
@@ -97,25 +135,59 @@ class RobustFingerprintDataset(Dataset):
             return torch.zeros(1, self.num_samples)
 
     def _get_random_ir(self):
-        if not self.ir_files: return None
-        ir_path = random.choice(self.ir_files)
+        """
+        Efficiently retrieves an IR from RAM (Pickle/H5) or Disk (WAV).
+        """
+        # Determine which source to use (WAV, Pickle, or H5)
+        # We assign probabilities based on availability
+        options = []
+        if self.ir_wav_files: options.append('wav')
+        if self.ir_pickle_data: options.append('pickle')
+        if self.ir_h5_cache: options.append('h5')
         
+        if not options: return None
+        
+        choice = random.choice(options)
+        
+        ir_sig = None
+        sr_ir = 44100 # Default assumption, corrected below if needed
+
         try:
-            if ir_path.endswith('.h5') and load_ir_from_h5:
-                s_idx, m_idx = random.randint(0, 2), random.randint(0, 2)
-                ir_sig, sr_ir = load_ir_from_h5(ir_path, source_idx=s_idx, mic_idx=m_idx)
+            if choice == 'h5':
+                # Fast Dictionary Lookup
+                fname = random.choice(self.h5_keys)
+                data_block = self.ir_h5_cache[fname]
                 
-            elif ir_path.endswith('.pickle.dat') and self.ir_pickle_data:
+                # data_block is (Sources, Mics, Samples) or (Angles, Samples)
+                dims = data_block.ndim
+                if dims == 3:
+                    s = random.randint(0, data_block.shape[0]-1)
+                    m = random.randint(0, data_block.shape[1]-1)
+                    ir_sig = data_block[s, m, :]
+                elif dims == 2:
+                    r = random.randint(0, data_block.shape[0]-1)
+                    ir_sig = data_block[r, :]
+                else:
+                    return None
+                
+                # Miracle dataset is usually 48kHz, but let's assume 44.1 or 48.
+                # Since we rely on resampling anyway, 44100 is a safe base unless specified.
+                sr_ir = 48000 
+                
+            elif choice == 'pickle':
+                # Fast List Lookup
                 record_idx = random.randint(0, len(self.ir_pickle_data) - 1)
-                raw_data = self.ir_pickle_data[record_idx][43]
-                ir_sig, sr_ir = np.array(raw_data, dtype=np.float32), 44100
-                    
-            elif ir_path.endswith('.wav'):
-                ir_sig, sr_ir = librosa.load(ir_path, sr=None, mono=True)
-            else:
-                return None
+                # Index 43 is rirData in the pickle list
+                ir_sig = np.array(self.ir_pickle_data[record_idx][43], dtype=np.float32)
+                sr_ir = 44100
+                
+            elif choice == 'wav':
+                # Slow Disk Load (but OS caching helps)
+                path = random.choice(self.ir_wav_files)
+                ir_sig, sr_ir = librosa.load(path, sr=None, mono=True)
                 
             return ir_sig, sr_ir
+            
         except Exception:
             return None
 
@@ -123,14 +195,22 @@ class RobustFingerprintDataset(Dataset):
         # 1. Reverb (50%)
         if random.random() > 0.5:
             ir_data = self._get_random_ir()
-            if ir_data:
+            if ir_data is not None:
                 ir_sig, sr_ir = ir_data
                 if sr_ir != self.sample_rate:
+                    # Calculate new length
                     num_s = int(len(ir_sig) * self.sample_rate / sr_ir)
+                    # Optimize: If IR is huge, truncate it before resampling to save CPU
+                    if num_s > self.num_samples * 2: 
+                        num_s = self.num_samples * 2
+                        
                     ir_sig = scipy.signal.resample(ir_sig, num_s)
                 
                 audio_np = waveform.numpy().flatten()
-                convolved = scipy.signal.fftconvolve(audio_np, ir_sig, mode='full')[:self.num_samples]
+                
+                # FFT Convolve
+                convolved = scipy.signal.fftconvolve(audio_np, ir_sig, mode='full')
+                convolved = convolved[:self.num_samples]
                 
                 max_val = np.max(np.abs(convolved))
                 if max_val > 0: convolved /= max_val
@@ -164,7 +244,6 @@ class RobustFingerprintDataset(Dataset):
         path = self.source_files[idx]
         clean_wave = self._load_audio_segment(path)
         
-        # Create robust pairs
         anchor_wave = self._augment(clean_wave.clone())
         positive_wave = self._augment(clean_wave.clone())
         
@@ -199,8 +278,6 @@ class FingerprintLightningModule(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         anchor, positive = batch
-        
-        # Hard Negative Mining (Shift Positive by 1)
         negative = torch.roll(positive, shifts=1, dims=0)
         
         a_emb = self(anchor)
@@ -209,21 +286,15 @@ class FingerprintLightningModule(pl.LightningModule):
         
         loss = self.triplet_loss(a_emb, p_emb, n_emb)
         
-        # Compute Accuracy
         dist_pos = F.pairwise_distance(a_emb, p_emb)
         dist_neg = F.pairwise_distance(a_emb, n_emb)
         accuracy = (dist_pos < dist_neg).float().mean()
         
-        # Log training metrics
-        # on_step=True logs every step (noisy but detailed)
-        # on_epoch=True logs the average at the end of the epoch
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
         self.log('train_acc', accuracy, on_step=True, on_epoch=True, prog_bar=True)
-        
         return loss
 
     def validation_step(self, batch, batch_idx):
-        """Calculates performance on unseen data."""
         anchor, positive = batch
         negative = torch.roll(positive, shifts=1, dims=0)
         
@@ -237,10 +308,8 @@ class FingerprintLightningModule(pl.LightningModule):
         dist_neg = F.pairwise_distance(a_emb, n_emb)
         accuracy = (dist_pos < dist_neg).float().mean()
         
-        # Log validation metrics (Only on epoch)
         self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log('val_acc', accuracy, on_step=False, on_epoch=True, prog_bar=True)
-        
         return loss
 
     def configure_optimizers(self):
@@ -257,43 +326,48 @@ def scan_files(config):
     for d in config['noise_dirs']:
         noises.extend(glob.glob(os.path.join(d, '*')))
     
-    irs = []
-    irs.extend(glob.glob(os.path.join(config['ir_root'], '**', '*.wav'), recursive=True))
-    irs.extend(glob.glob(os.path.join(config['ir_root'], '**', '*.h5'), recursive=True))
-    irs.extend(glob.glob(os.path.join(config['ir_root'], '**', '*.pickle.dat'), recursive=True))
+    # Scan for specific types
+    ir_wavs = glob.glob(os.path.join(config['ir_root'], '**', '*.wav'), recursive=True)
+    ir_h5s = glob.glob(os.path.join(config['ir_root'], '**', '*.h5'), recursive=True)
+    ir_pickles = glob.glob(os.path.join(config['ir_root'], '**', '*.pickle.dat'), recursive=True)
     
-    print(f"Sources: {len(sources)} | Noises: {len(noises)} | IRs: {len(irs)}")
-    return sources, noises, irs
+    print(f"Sources: {len(sources)} | Noises: {len(noises)}")
+    print(f"IRs: {len(ir_wavs)} WAVs, {len(ir_h5s)} H5s, {len(ir_pickles)} Pickles")
+    
+    return sources, noises, ir_wavs, ir_h5s, ir_pickles
 
 def main():
     # 1. Prepare Data
-    sources, noises, irs = scan_files(CONFIG)
+    sources, noises, ir_wavs, ir_h5s, ir_pickles = scan_files(CONFIG)
     if not sources:
         print("No sources found!")
         return
         
-    # --- NEW: Split Train/Val ---
     random.shuffle(sources)
     split_idx = int(len(sources) * 0.9)
     train_sources = sources[:split_idx]
     val_sources = sources[split_idx:]
     print(f"Training Samples: {len(train_sources)} | Validation Samples: {len(val_sources)}")
 
-    # Preload Pickle
+    # 2. Preload Data into RAM
+    # Load Pickles
     pickle_data = None
-    pickle_files = [f for f in irs if f.endswith('.pickle.dat')]
-    if pickle_files:
-        print("Preloading pickle data...")
+    if ir_pickles:
+        print(f"Preloading {len(ir_pickles)} pickle files...")
         pickle_data = []
-        for pf in pickle_files:
+        for pf in ir_pickles:
             try:
                 with open(pf, 'rb') as f:
                     pickle_data.extend(pickle.load(f))
             except Exception: pass
+            
+    # Load H5s (NEW)
+    h5_cache = preload_h5_data(ir_h5s)
 
-    # Dataset & Loader
-    train_dataset = RobustFingerprintDataset(train_sources, noises, irs, pickle_data)
-    val_dataset = RobustFingerprintDataset(val_sources, noises, irs, pickle_data)
+    # 3. Dataset & Loader
+    # We pass the cache to the dataset
+    train_dataset = RobustFingerprintDataset(train_sources, noises, ir_wavs, pickle_data, h5_cache)
+    val_dataset = RobustFingerprintDataset(val_sources, noises, ir_wavs, pickle_data, h5_cache)
     
     train_loader = DataLoader(
         train_dataset, 
@@ -313,17 +387,17 @@ def main():
         pin_memory=True
     )
 
-    # 2. Init Model
+    # 4. Init Model
     model = FingerprintLightningModule(
         output_dim=CONFIG['output_dim'], 
         margin=CONFIG['margin'], 
         lr=CONFIG['learning_rate']
     )
 
-    # 3. WandB Logger
+    # 5. WandB Logger
     wandb_logger = WandbLogger(project=CONFIG['project_name'], config=CONFIG)
     
-    # 4. Trainer
+    # 6. Trainer
     trainer = pl.Trainer(
         max_epochs=CONFIG['epochs'],
         accelerator="auto",      
@@ -335,7 +409,6 @@ def main():
     )
 
     print("Starting Training...")
-    # Pass both loaders to fit
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
 if __name__ == "__main__":
