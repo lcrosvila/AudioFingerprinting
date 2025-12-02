@@ -2,6 +2,7 @@
 # Ignore only the data folder inside room-impulse-responses
 data/
 wandb/
+dataset_cache*
 
 *.wav
 *.flac
